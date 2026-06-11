@@ -74,8 +74,36 @@ async function detectBPM(audioUrl) {
   });
 }
 
+// ── BPM LOOKUP via MusicBrainz + AcousticBrainz (fallback) ──
+async function lookupBPMByTitle(title, artist) {
+  try {
+    // Search MusicBrainz for the recording
+    const query = encodeURIComponent(`recording:"${title}" AND artist:"${artist}"`);
+    const mbRes = await fetch(
+      `https://musicbrainz.org/ws/2/recording/?query=${query}&limit=1&fmt=json`,
+      { headers: { 'User-Agent': 'FlowBeat/1.0 (https://ioanral-ux.github.io/flowbeat)' } }
+    );
+    if (!mbRes.ok) return null;
+    const mbData = await mbRes.json();
+    const recording = mbData.recordings?.[0];
+    if (!recording) return null;
+
+    // Try AcousticBrainz for BPM data
+    const abRes = await fetch(
+      `https://acousticbrainz.org/${recording.id}/low-level`,
+      { headers: { 'User-Agent': 'FlowBeat/1.0' } }
+    );
+    if (!abRes.ok) return null;
+    const abData = await abRes.json();
+    const bpm = abData?.rhythm?.bpm;
+    return bpm ? Math.round(bpm * 10) / 10 : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // ── MAIN ENDPOINT: POST /analyze ──────────────────────
-// Body: { tracks: [{ id, previewUrl }] }
+// Body: { tracks: [{ id, previewUrl, title, artist }] }
 // Returns: { results: [{ id, bpm, error? }] }
 app.post('/analyze', async (req, res) => {
   const { tracks } = req.body;
@@ -90,16 +118,26 @@ app.post('/analyze', async (req, res) => {
 
   // Process all tracks in parallel
   const results = await Promise.all(
-    tracks.map(async ({ id, previewUrl }) => {
-      if (!previewUrl) {
-        return { id, bpm: null, error: 'No preview available' };
+    tracks.map(async ({ id, previewUrl, title, artist }) => {
+      // Try preview URL first (most accurate)
+      if (previewUrl) {
+        try {
+          const bpm = await detectBPM(previewUrl);
+          return { id, bpm, source: 'preview' };
+        } catch (e) {
+          console.log(`Preview BPM failed for ${title}, trying MusicBrainz...`);
+        }
       }
-      try {
-        const bpm = await detectBPM(previewUrl);
-        return { id, bpm };
-      } catch (e) {
-        return { id, bpm: null, error: e.message };
+      // Fall back to MusicBrainz lookup
+      if (title && artist) {
+        try {
+          const bpm = await lookupBPMByTitle(title, artist);
+          if (bpm) return { id, bpm, source: 'musicbrainz' };
+        } catch (e) {
+          console.log(`MusicBrainz lookup failed for ${title}`);
+        }
       }
+      return { id, bpm: null, error: 'No BPM data available' };
     })
   );
 
